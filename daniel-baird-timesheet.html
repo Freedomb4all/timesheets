@@ -878,6 +878,7 @@ function saveManual() {
   document.getElementById('m-out').value='';
   showToast('Record saved', true);
   updateStats();
+  syncCurrentPeriod();
 }
 
 // ── Edit modal ────────────────────────────────────────
@@ -964,6 +965,7 @@ function saveEdit() {
   renderRecords();
   updateStats();
   showToast('Record updated', true);
+  syncCurrentPeriod();
 }
 
 // ── Delete modal ──────────────────────────────────────
@@ -981,6 +983,7 @@ function confirmDelete() {
   renderRecords();
   updateStats();
   showToast('Record deleted', false);
+  syncCurrentPeriod();
 }
 
 // ── Render records ────────────────────────────────────
@@ -1060,34 +1063,49 @@ function showToast(msg, success) {
 
 
 // ── Pay Period Engine ─────────────────────────────────
-// Anchor: Sunday March 8 2026
-var PP_ANCHOR = new Date('2026-03-08T00:00:00');
+// Anchor: Sunday March 8 2026 — purely date-based, no timezone issues
+// We work in whole days only using year/month/day to avoid DST and UTC drift
+
+function dateToInt(dateStr) {
+  // Convert YYYY-MM-DD to a simple integer day count from a fixed epoch
+  var parts = dateStr.split('-');
+  var y = parseInt(parts[0]), m = parseInt(parts[1]), d = parseInt(parts[2]);
+  // Days since year 0 approximation — consistent and timezone-free
+  var a = Math.floor((14 - m) / 12);
+  var yr = y + 4800 - a;
+  var mo = m + 12 * a - 3;
+  return d + Math.floor((153*mo+2)/5) + 365*yr + Math.floor(yr/4) - Math.floor(yr/100) + Math.floor(yr/400) - 32045;
+}
+
+var PP_ANCHOR_INT = dateToInt('2026-03-08');
 
 function getPeriodIndex(dateStr) {
-  // Returns which pay period index (0-based) a date falls in
-  var d = new Date(dateStr + 'T00:00:00');
-  var diff = Math.floor((d - PP_ANCHOR) / (1000*60*60*24));
-  if (diff < 0) return Math.floor(diff / 14) - 1;
+  var diff = dateToInt(dateStr) - PP_ANCHOR_INT;
   return Math.floor(diff / 14);
 }
 
-function getPeriodBounds(idx) {
-  // Returns {start, end, w1start, w1end, w2start, w2end} as Date objects
-  var start = new Date(PP_ANCHOR.getTime() + idx * 14 * 24*60*60*1000);
-  var w1end  = new Date(start.getTime() +  6 * 24*60*60*1000);
-  var w2start= new Date(start.getTime() +  7 * 24*60*60*1000);
-  var end    = new Date(start.getTime() + 13 * 24*60*60*1000);
-  return { start:start, w1end:w1end, w2start:w2start, end:end };
+function addDays(dateStr, days) {
+  // Add days to a YYYY-MM-DD string, returns new YYYY-MM-DD string
+  var d = new Date(dateStr + 'T12:00:00'); // noon avoids DST edge
+  d.setDate(d.getDate() + days);
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 }
 
-function fmtPeriodDate(d) {
-  var mm = String(d.getMonth()+1).padStart(2,'0');
-  var dd = String(d.getDate()).padStart(2,'0');
-  return d.getFullYear()+'/'+mm+'/'+dd;
+function getPeriodBounds(idx) {
+  // Calculate start date from anchor + idx*14 days
+  var startStr = addDays('2026-03-08', idx * 14);
+  var w1endStr  = addDays(startStr, 6);
+  var w2startStr= addDays(startStr, 7);
+  var endStr    = addDays(startStr, 13);
+  return { startStr:startStr, w1endStr:w1endStr, w2startStr:w2startStr, endStr:endStr };
+}
+
+function fmtPeriodDate(dateStr) {
+  var parts = dateStr.split('-');
+  return parts[0]+'/'+parts[1]+'/'+parts[2];
 }
 
 function calcPayPeriods() {
-  // Group records by period index
   var byPeriod = {};
   records.forEach(function(r) {
     if (!r.date) return;
@@ -1096,11 +1114,9 @@ function calcPayPeriods() {
     byPeriod[idx].push(r);
   });
 
-  var today = new Date();
-  today.setHours(0,0,0,0);
-  var currentIdx = getPeriodIndex(today.toISOString().slice(0,10));
+  var todayStr = new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD in local time
+  var currentIdx = getPeriodIndex(todayStr);
 
-  // Build period summaries — current + past 12
   var periods = [];
   for (var i = currentIdx; i >= currentIdx - 12; i--) {
     var bounds = getPeriodBounds(i);
@@ -1108,8 +1124,8 @@ function calcPayPeriods() {
     var w1h=0, w2h=0, vacH=0, vacNotes=[], holH=0, holNotes=[], sickH=0, sickNotes=[];
 
     recs.forEach(function(r) {
-      var d = new Date(r.date+'T00:00:00');
-      var isW1 = d <= bounds.w1end;
+      // Compare date strings directly — no timezone conversion
+      var isW1 = r.date <= bounds.w1endStr;
       if (r.type === 'Regular') {
         if (isW1) w1h += (r.hours||0); else w2h += (r.hours||0);
       } else if (r.type === 'Vacation') {
@@ -1132,7 +1148,7 @@ function calcPayPeriods() {
     var totalH = Math.round((w1h+w2h)*10)/10;
     var withoutOT = Math.round((w1Reg+w2Reg)*10)/10;
 
-    var isComplete = bounds.end < today;
+    var isComplete = bounds.endStr < todayStr;
     var isCurrent  = (i === currentIdx);
 
     periods.push({
@@ -1152,45 +1168,41 @@ function calcPayPeriods() {
   return periods;
 }
 
-// Track which periods have been synced
-var syncedPeriods = JSON.parse(localStorage.getItem('db_synced_periods') || '[]');
+function syncCurrentPeriod() {
+  // Syncs ALL periods that have at least one record — live update, not just completed
+  if (!sheetsUrl) return;
+  var periods = calcPayPeriods();
+  periods.forEach(function(p) {
+    var hasRecords = (p.w1h > 0 || p.w2h > 0 || p.vacH > 0 || p.holH > 0 || p.sickH > 0);
+    if (!hasRecords) return;
+    var payload = {
+      action: 'payroll',
+      employee: EMPLOYEE,
+      payPeriod: fmtPeriodDate(p.bounds.startStr)+' to '+fmtPeriodDate(p.bounds.endStr),
+      week1: p.w1h,
+      week2: p.w2h,
+      twoWeekTotal: p.totalH,
+      autoCalc: p.totalH,
+      withoutOT: p.withoutOT,
+      ot: p.totalOT,
+      vacation: p.vacH,
+      reasonVaca: p.vacNotes,
+      holiday: p.holH,
+      reasonHoliday: p.holNotes,
+      sick: p.sickH,
+      reasonSick: p.sickNotes,
+      isComplete: p.isComplete
+    };
+    fetch(sheetsUrl, {
+      method: 'POST',
+      mode: 'no-cors',
+      body: JSON.stringify(payload)
+    }).catch(function(){});
+  });
+}
 
 function checkAndSyncPeriods() {
-  if (!sheetsUrl) return;
-  var today = new Date();
-  today.setHours(0,0,0,0);
-  var currentIdx = getPeriodIndex(today.toISOString().slice(0,10));
-  var periods = calcPayPeriods();
-
-  periods.forEach(function(p) {
-    if (p.isComplete && syncedPeriods.indexOf(p.idx) === -1) {
-      // Sync this completed period
-      var payload = {
-        action: 'payroll',
-        employee: EMPLOYEE,
-        payPeriod: fmtPeriodDate(p.bounds.start)+' to '+fmtPeriodDate(p.bounds.end),
-        week1: p.w1h,
-        week2: p.w2h,
-        twoWeekTotal: p.totalH,
-        autoCalc: p.totalH,
-        withoutOT: p.withoutOT,
-        ot: p.totalOT,
-        vacation: p.vacH,
-        reasonVaca: p.vacNotes,
-        holiday: p.holH,
-        reasonHoliday: p.holNotes,
-        sick: p.sickH,
-        reasonSick: p.sickNotes
-      };
-      fetch(sheetsUrl, {
-        method: 'POST',
-        mode: 'no-cors',
-        body: JSON.stringify(payload)
-      }).catch(function(){});
-      syncedPeriods.push(p.idx);
-      localStorage.setItem('db_synced_periods', JSON.stringify(syncedPeriods));
-    }
-  });
+  syncCurrentPeriod();
 }
 
 function renderPayroll() {
@@ -1201,14 +1213,12 @@ function renderPayroll() {
     var statusLabel = p.isCurrent ? 'current period' : 'complete';
     var synced = syncedPeriods.indexOf(p.idx) !== -1;
     var syncLine = p.isComplete
-      ? (synced
-          ? '<div class="pp-synced">&#10003; synced to Google Sheet</div>'
-          : '<div class="pp-unsynced">&#9679; will sync when period closes</div>')
-      : '<div class="pp-unsynced">&#9679; in progress — syncs when period ends</div>';
+      ? '<div class="pp-synced">&#10003; synced to Google Sheet</div>'
+      : '<div class="pp-synced">&#9679; live — updates on every record save</div>';
 
     html += '<div class="pp-card">';
     html += '<div class="pp-header">';
-    html += '<div class="pp-period">'+fmtPeriodDate(p.bounds.start)+' &ndash; '+fmtPeriodDate(p.bounds.end)+'</div>';
+    html += '<div class="pp-period">'+fmtPeriodDate(p.bounds.startStr)+' &ndash; '+fmtPeriodDate(p.bounds.endStr)+'</div>';
     html += '<span class="pp-status '+statusClass+'">'+statusLabel+'</span>';
     html += '</div>';
     html += '<div class="pp-grid">';
@@ -1233,3 +1243,4 @@ refreshUI();
 </script>
 </body>
 </html>
+
